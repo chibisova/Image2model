@@ -17,7 +17,8 @@ Core requirement driving everything below: the output mesh needs clean, animatab
    ![Meshy 5 generated mesh, front view](images/meshy5_output.png)
    *Meshy 5 output — stylized dog mesh, no part segmentation.*
 
-   ![Meshy 5 mesh showing ear/paw intersection](images/meshy5_output_intersection.png)
+   <img src="images/meshy5_output_intersection.png" width="400" alt="Meshy 5 mesh showing ear/paw intersection">
+
    *Close-up on the ear/front-paw intersection that motivated the segmentation work below.*
 3. Built a Blender script (`turntable_render.py`) to auto-render the generated mesh from many camera angles (elevation rings × azimuth steps), saving camera intrinsics (K) + extrinsics per view as JSON — intended as input for a segmentation-and-back-projection step.
    - Added a studio 3-point light rig (key/fill/rim) + flat world-ambient fill after initial renders came out too dark/harsh.
