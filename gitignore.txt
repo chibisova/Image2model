@@ -1,0 +1,33 @@
+# Output images (renders, segmentation results, mesh screenshots)
+images/
+*.png
+*.jpg
+*.jpeg
+
+# If you want to keep a few reference images tracked despite the rules above,
+# whitelist them explicitly, e.g.:
+# !images/
+
+# Always keep documentation images tracked
+!documentation/images/
+!documentation/images/*.png
+!documentation/images/*.jpg
+!documentation/images/*.jpeg
+
+# Turntable / segmentation pipeline outputs
+turntable_output/
+segmentation_output/
+
+# Model checkpoints (large binaries, re-downloadable)
+*.pt
+*.pth
+*.ckpt
+
+# Python
+venv/
+__pycache__/
+*.pyc
+
+# Blender backups
+*.blend1
+*.blend2
