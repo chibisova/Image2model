@@ -6,7 +6,7 @@ images/
 
 # If you want to keep a few reference images tracked despite the rules above,
 # whitelist them explicitly, e.g.:
-# !images/
+# !images/keep_this.png
 
 # Always keep documentation images tracked
 !documentation/images/
@@ -14,9 +14,13 @@ images/
 !documentation/images/*.jpg
 !documentation/images/*.jpeg
 
+# macOS
+*.DS_Store
+
 # Turntable / segmentation pipeline outputs
 turntable_output/
 segmentation_output/
+outputs/
 
 # Model checkpoints (large binaries, re-downloadable)
 *.pt
@@ -24,10 +28,15 @@ segmentation_output/
 *.ckpt
 
 # Python
-venv/
+image2model/
 __pycache__/
 *.pyc
 
 # Blender backups
 *.blend1
 *.blend2
+
+# 3D
+*.glb
+*.fbx
+*.obj
