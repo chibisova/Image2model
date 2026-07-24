@@ -1,0 +1,297 @@
+"""
+Turntable render script for Blender.
+
+Renders N views around a target mesh at one or more elevation rings,
+and dumps camera intrinsics + extrinsics for each view as JSON so you
+can later back-project 2D segmentation masks (e.g. from Grounded-SAM)
+onto the mesh.
+
+USAGE
+-----
+1. Open your .blend file with the dog mesh already imported/posed.
+2. Edit the CONFIG block below (target object name, ring counts, etc).
+3. Run from the Blender Scripting tab, OR from command line:
+
+   blender your_file.blend --background --python turntable_render.py
+
+OUTPUT
+------
+<output_dir>/
+    images/
+        view_0000.png
+        view_0001.png
+        ...
+    cameras/
+        view_0000.json   <- K, RT (world->cam), cam position, fov, etc
+        view_0001.json
+        ...
+    cameras_all.json     <- all camera data in one file, for convenience
+"""
+
+import bpy
+import math
+import json
+import os
+import mathutils
+
+# =========================================================
+# CONFIG - edit these
+# =========================================================
+TARGET_OBJECT_NAME = "Mesh_0"          # name of your mesh object in the outliner
+OUTPUT_DIR = "//turntable_output"   # "//" = relative to the .blend file
+
+RADIUS = None                       # None = auto-compute from mesh bounds
+ELEVATIONS_DEG = [0, 30, -20, 60]   # camera ring elevations (0 = equator)
+VIEWS_PER_RING = 8                  # azimuth steps per elevation ring
+IMAGE_RES = (1024, 1024)
+ENGINE = "BLENDER_EEVEE"            # or "CYCLES"
+SAMPLES = 64
+BACKGROUND_TRANSPARENT = True       # useful for clean masks later
+LENS_MM = 50                        # camera focal length
+
+SETUP_STUDIO_LIGHTING = True        # add key/fill/rim lights + ambient world light
+LIGHT_ENERGY_KEY = 800               # watts, area light
+LIGHT_ENERGY_FILL = 400
+LIGHT_ENERGY_RIM = 500
+WORLD_AMBIENT_STRENGTH = 0.6         # flat ambient fill from all directions (0 = off)
+
+# =========================================================
+# Helpers
+# =========================================================
+
+def get_mesh_bounds_center_radius(obj):
+    """World-space bounding sphere center + radius of the object."""
+    bbox_world = [obj.matrix_world @ mathutils.Vector(c) for c in obj.bound_box]
+    xs = [v.x for v in bbox_world]
+    ys = [v.y for v in bbox_world]
+    zs = [v.z for v in bbox_world]
+    center = mathutils.Vector(
+        ((min(xs) + max(xs)) / 2, (min(ys) + max(ys)) / 2, (min(zs) + max(zs)) / 2)
+    )
+    radius = max(
+        (mathutils.Vector((x, y, z)) - center).length
+        for x, y, z in zip(xs, ys, zs)
+    )
+    return center, radius
+
+
+def make_camera(name="TurntableCam"):
+    cam_data = bpy.data.cameras.new(name)
+    cam_data.lens = LENS_MM
+    cam_obj = bpy.data.objects.new(name, cam_data)
+    bpy.context.collection.objects.link(cam_obj)
+    return cam_obj
+
+
+def point_camera_at(cam_obj, target_point):
+    direction = target_point - cam_obj.location
+    rot_quat = direction.to_track_quat("-Z", "Y")
+    cam_obj.rotation_euler = rot_quat.to_euler()
+
+
+def compute_intrinsics(cam_data, res_x, res_y):
+    """Pinhole intrinsics matrix K from Blender camera + render resolution."""
+    sensor_width = cam_data.sensor_width
+    sensor_height = cam_data.sensor_height
+    focal = cam_data.lens
+
+    if cam_data.sensor_fit == "VERTICAL":
+        fy = (focal / sensor_height) * res_y
+        fx = fy  # square pixels assumed
+    else:
+        fx = (focal / sensor_width) * res_x
+        fy = fx
+
+    cx = res_x / 2.0
+    cy = res_y / 2.0
+
+    K = [
+        [fx, 0.0, cx],
+        [0.0, fy, cy],
+        [0.0, 0.0, 1.0],
+    ]
+    return K
+
+
+def get_extrinsics(cam_obj):
+    """World-to-camera 4x4 matrix (OpenCV convention: +X right, +Y down, +Z forward)."""
+    # Blender camera looks down -Z with +Y up. Convert to CV convention.
+    blender_world_to_cam = cam_obj.matrix_world.inverted()
+
+    cv_from_blender = mathutils.Matrix(
+        ((1, 0, 0, 0), (0, -1, 0, 0), (0, 0, -1, 0), (0, 0, 0, 1))
+    )
+    world_to_cv_cam = cv_from_blender @ blender_world_to_cam
+    return [list(row) for row in world_to_cv_cam]
+
+
+def setup_studio_lighting(center, radius):
+    """Simple 3-point area light rig orbiting the target, plus flat world
+    ambient fill. Positions scale with the mesh's bounding radius so it
+    works regardless of the dog's actual size/units."""
+
+    def make_area_light(name, energy, size, location, target):
+        light_data = bpy.data.lights.new(name, type="AREA")
+        light_data.energy = energy
+        light_data.size = size
+        light_obj = bpy.data.objects.new(name, light_data)
+        bpy.context.collection.objects.link(light_obj)
+        light_obj.location = location
+        point_camera_at(light_obj, target)  # area lights aim the same way cameras do
+        return light_obj
+
+    light_dist = radius * 3.5
+    light_size = radius * 1.5
+
+    lights = []
+
+    # Key light: front-upper-right, main illumination
+    key_pos = center + mathutils.Vector((light_dist * 0.7, -light_dist * 0.7, light_dist * 0.6))
+    lights.append(make_area_light("StudioKey", LIGHT_ENERGY_KEY, light_size, key_pos, center))
+
+    # Fill light: front-upper-left, softer, fills key's shadows
+    fill_pos = center + mathutils.Vector((-light_dist * 0.8, -light_dist * 0.4, light_dist * 0.3))
+    lights.append(make_area_light("StudioFill", LIGHT_ENERGY_FILL, light_size, fill_pos, center))
+
+    # Rim light: behind, separates subject from background
+    rim_pos = center + mathutils.Vector((0, light_dist * 0.9, light_dist * 0.5))
+    lights.append(make_area_light("StudioRim", LIGHT_ENERGY_RIM, light_size, rim_pos, center))
+
+    # Flat ambient fill from the world background so no side is ever fully black
+    if WORLD_AMBIENT_STRENGTH > 0:
+        world = bpy.context.scene.world
+        if world is None:
+            world = bpy.data.worlds.new("StudioWorld")
+            bpy.context.scene.world = world
+        world.use_nodes = True
+        bg_node = world.node_tree.nodes.get("Background")
+        if bg_node is not None:
+            bg_node.inputs["Color"].default_value = (1.0, 1.0, 1.0, 1.0)
+            bg_node.inputs["Strength"].default_value = WORLD_AMBIENT_STRENGTH
+
+    return lights
+
+
+def setup_render_settings():
+    scene = bpy.context.scene
+    scene.render.engine = ENGINE
+    scene.render.resolution_x = IMAGE_RES[0]
+    scene.render.resolution_y = IMAGE_RES[1]
+    scene.render.image_settings.file_format = "PNG"
+    scene.render.film_transparent = BACKGROUND_TRANSPARENT
+
+    if ENGINE == "CYCLES":
+        scene.cycles.samples = SAMPLES
+    elif "EEVEE" in ENGINE:
+        try:
+            scene.eevee.taa_render_samples = SAMPLES
+        except AttributeError:
+            pass
+
+
+def ensure_dir(path):
+    if path.startswith("//") and not bpy.data.filepath:
+        # Blend file was never saved, so "//" has nothing to resolve against.
+        # Fall back to a writable location instead of crashing.
+        fallback = os.path.join(os.path.expanduser("~"), "turntable_output")
+        print(f"WARNING: .blend file is unsaved, '//' can't resolve. "
+              f"Using fallback output dir: {fallback}")
+        abs_path = fallback
+    else:
+        abs_path = bpy.path.abspath(path)
+
+    os.makedirs(abs_path, exist_ok=True)
+    return abs_path
+
+
+# =========================================================
+# Main
+# =========================================================
+
+def main():
+    obj = bpy.data.objects.get(TARGET_OBJECT_NAME)
+    if obj is None:
+        raise RuntimeError(
+            f"Object '{TARGET_OBJECT_NAME}' not found. "
+            f"Available objects: {[o.name for o in bpy.data.objects]}"
+        )
+
+    center, mesh_radius = get_mesh_bounds_center_radius(obj)
+    radius = RADIUS if RADIUS is not None else mesh_radius * 3.0
+
+    setup_render_settings()
+
+    studio_lights = []
+    if SETUP_STUDIO_LIGHTING:
+        studio_lights = setup_studio_lighting(center, radius)
+
+    out_dir = ensure_dir(OUTPUT_DIR)
+    img_dir = os.path.join(out_dir, "images")
+    cam_dir = os.path.join(out_dir, "cameras")
+    os.makedirs(img_dir, exist_ok=True)
+    os.makedirs(cam_dir, exist_ok=True)
+
+    cam_obj = make_camera()
+    bpy.context.scene.camera = cam_obj
+
+    all_cameras = []
+    view_index = 0
+
+    for elev_deg in ELEVATIONS_DEG:
+        elev_rad = math.radians(elev_deg)
+        for i in range(VIEWS_PER_RING):
+            azim_rad = (2 * math.pi / VIEWS_PER_RING) * i
+
+            x = center.x + radius * math.cos(elev_rad) * math.cos(azim_rad)
+            y = center.y + radius * math.cos(elev_rad) * math.sin(azim_rad)
+            z = center.z + radius * math.sin(elev_rad)
+
+            cam_obj.location = (x, y, z)
+            point_camera_at(cam_obj, center)
+            bpy.context.view_layer.update()
+
+            view_name = f"view_{view_index:04d}"
+            img_path = os.path.join(img_dir, view_name + ".png")
+
+            bpy.context.scene.render.filepath = img_path
+            bpy.ops.render.render(write_still=True)
+
+            K = compute_intrinsics(
+                cam_obj.data, IMAGE_RES[0], IMAGE_RES[1]
+            )
+            RT = get_extrinsics(cam_obj)
+
+            cam_record = {
+                "view_name": view_name,
+                "image_path": os.path.relpath(img_path, out_dir),
+                "elevation_deg": elev_deg,
+                "azimuth_deg": math.degrees(azim_rad),
+                "camera_location_world": list(cam_obj.location),
+                "target_center_world": list(center),
+                "K": K,
+                "world_to_cam": RT,
+                "resolution": list(IMAGE_RES),
+            }
+
+            with open(os.path.join(cam_dir, view_name + ".json"), "w") as f:
+                json.dump(cam_record, f, indent=2)
+
+            all_cameras.append(cam_record)
+            view_index += 1
+
+            print(f"[{view_index}/{len(ELEVATIONS_DEG) * VIEWS_PER_RING}] "
+                  f"rendered {view_name} (elev={elev_deg}, azim={math.degrees(azim_rad):.1f})")
+
+    with open(os.path.join(out_dir, "cameras_all.json"), "w") as f:
+        json.dump(all_cameras, f, indent=2)
+
+    # cleanup: remove the temp camera and lights
+    bpy.data.objects.remove(cam_obj, do_unlink=True)
+    for light_obj in studio_lights:
+        bpy.data.objects.remove(light_obj, do_unlink=True)
+
+    print(f"\nDone. {view_index} views rendered to: {out_dir}")
+
+
+if __name__ == "__main__":
+    main()
